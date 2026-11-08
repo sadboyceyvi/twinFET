@@ -1,0 +1,100 @@
+name: Build TwinFET
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+          - name: macOS
+            os: macos-latest
+          - name: Linux
+            os: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find project folder
+        shell: bash
+        run: |
+          if [ -f CMakeLists.txt ]; then P=.; else P=$(dirname "$(find . -maxdepth 3 -name CMakeLists.txt | head -n 1)"); fi
+          echo "Project folder: $P"
+          echo "PROJ=$P" >> "$GITHUB_ENV"
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev libjack-jackd2-dev libfreetype-dev libfontconfig1-dev libx11-dev libxcomposite-dev libxcursor-dev libxext-dev libxinerama-dev libxrandr-dev libxrender-dev libglu1-mesa-dev mesa-common-dev libcurl4-openssl-dev libgtk-3-dev libwebkit2gtk-4.1-dev
+
+      - name: Configure
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" == "macOS" ]; then
+            cmake -S "$PROJ" -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DTWINFET_BUILD_TESTS=ON
+          else
+            cmake -S "$PROJ" -B build -DCMAKE_BUILD_TYPE=Release -DTWINFET_BUILD_TESTS=ON
+          fi
+
+      - name: Build plugin
+        run: cmake --build build --config Release --parallel 4 --target TwinFET_All
+
+      - name: DSP self-test
+        continue-on-error: true
+        shell: bash
+        run: |
+          cmake --build build --config Release --target twinfet_measure
+          mkdir -p results
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            ./build/Release/twinfet_measure.exe robust results
+          else
+            ./build/twinfet_measure robust results
+          fi
+
+      - name: Collect plugin files
+        shell: bash
+        run: |
+          mkdir -p dist
+          ART=build/TwinFET_artefacts/Release
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            # single-file VST3 (one DLL): just drop it into C:\Program Files\Common Files\VST3
+            DLL=$(find "$ART/VST3/TwinFET.vst3/Contents" -type f -name "TwinFET.vst3" | head -n 1)
+            cp "$DLL" dist/TwinFET.vst3
+            mkdir -p dist/Standalone
+            cp "$ART/Standalone/TwinFET.exe" dist/Standalone/
+          elif [ "$RUNNER_OS" == "macOS" ]; then
+            cp -R "$ART/VST3/TwinFET.vst3" dist/
+            cp -R "$ART/AU/TwinFET.component" dist/
+            cp -R "$ART/Standalone/TwinFET.app" dist/
+          else
+            cp -R "$ART/VST3/TwinFET.vst3" dist/
+            cp "$ART/Standalone/TwinFET" dist/
+          fi
+          cp "$PROJ/README.md" dist/ || true
+
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco upgrade innosetup -y --no-progress | Out-Null
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = (Get-Command ISCC.exe -ErrorAction Stop).Source }
+          $iss = Get-ChildItem -Path $env:PROJ -Filter installer.iss -Recurse -Depth 2 | Select-Object -First 1
+          if (-not $iss) { throw "installer.iss not found - upload it next to CMakeLists.txt" }
+          $art = (Resolve-Path "build/TwinFET_artefacts/Release").Path
+          $out = (Resolve-Path "dist").Path
+          & $iscc "/DArtefacts=$art" "/DOutDir=$out" "/DAppVersion=1.0.${{ github.run_number }}" $iss.FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TwinFET-${{ matrix.name }}
+          path: dist
